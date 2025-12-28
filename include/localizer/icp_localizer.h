@@ -46,6 +46,7 @@ namespace fastlio
             voxel_refine_filter_.setLeafSize(refine_resolution_, refine_resolution_, refine_resolution_);
         }
         double getScore() const { return score_; }
+        double getFitnessScore() const { return score_; }  // 别名，与faster-lio保持一致
 
         bool isSuccess() const { return success_; }
 

@@ -1,4 +1,10 @@
 #include "commons.h"
+#include <cmath>
+#include <algorithm>
+#include <vector>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace fastlio
 {
@@ -244,4 +250,210 @@ Eigen::Vector3d rotate2rpy(Eigen::Matrix3d &rot)
     double pitch = asin(-rot(2, 0));
     double yaw = std::atan2(rot(1, 0), rot(0, 0));
     return Eigen::Vector3d(roll, pitch, yaw);
+}
+
+Eigen::Matrix3d averageRotations(const std::vector<Eigen::Matrix3d>& rotations)
+{
+    if (rotations.empty())
+        return Eigen::Matrix3d::Identity();
+    
+    // 转换为四元数后平均
+    std::vector<Eigen::Quaterniond> quaternions;
+    for (const auto& rot : rotations)
+    {
+        Eigen::Quaterniond q(rot);
+        // 确保四元数在同一个半球（避免 q 和 -q 的问题）
+        if (quaternions.size() > 0 && quaternions[0].dot(q) < 0)
+            q.coeffs() = -q.coeffs();
+        quaternions.push_back(q);
+    }
+    
+    // 计算平均四元数（简单平均，然后归一化）
+    Eigen::Vector4d mean_coeffs = Eigen::Vector4d::Zero();
+    for (const auto& q : quaternions)
+    {
+        mean_coeffs += q.coeffs();
+    }
+    mean_coeffs /= quaternions.size();
+    
+    Eigen::Quaterniond mean_quat(mean_coeffs);
+    mean_quat.normalize();
+    
+    return mean_quat.toRotationMatrix();
+}
+
+RelocStatistics calculateRelocStatistics(const std::vector<Eigen::Matrix4d>& poses, 
+                                          const std::vector<double>& fitnesses)
+{
+    RelocStatistics stats;
+    stats.poses = poses;
+    stats.fitnesses = fitnesses;
+    
+    if (poses.empty() || fitnesses.empty())
+        return stats;
+    
+    // 提取平移和旋转
+    std::vector<Eigen::Vector3d> translations;
+    std::vector<Eigen::Matrix3d> rotations;
+    
+    for (const auto& pose : poses)
+    {
+        translations.push_back(pose.block<3, 1>(0, 3));
+        rotations.push_back(pose.block<3, 3>(0, 0));
+    }
+    
+    // 计算平均平移
+    stats.mean_translation = Eigen::Vector3d::Zero();
+    for (const auto& t : translations)
+        stats.mean_translation += t;
+    stats.mean_translation /= translations.size();
+    
+    // 计算平均旋转
+    stats.mean_rotation = averageRotations(rotations);
+    
+    // 计算平均位姿
+    stats.mean_pose.setIdentity();
+    stats.mean_pose.block<3, 3>(0, 0) = stats.mean_rotation;
+    stats.mean_pose.block<3, 1>(0, 3) = stats.mean_translation;
+    
+    // 计算平移标准差
+    Eigen::Vector3d translation_variance = Eigen::Vector3d::Zero();
+    for (const auto& t : translations)
+    {
+        Eigen::Vector3d diff = t - stats.mean_translation;
+        translation_variance += diff.cwiseProduct(diff);
+    }
+    translation_variance /= translations.size();
+    stats.std_translation = translation_variance.cwiseSqrt();
+    
+    // 计算最大偏差（平移）
+    stats.max_dev_translation = Eigen::Vector3d::Zero();
+    for (const auto& t : translations)
+    {
+        Eigen::Vector3d diff = (t - stats.mean_translation).cwiseAbs();
+        stats.max_dev_translation = stats.max_dev_translation.cwiseMax(diff);
+    }
+    
+    // 计算最小/最大平移
+    stats.min_translation = translations[0];
+    stats.max_translation = translations[0];
+    for (const auto& t : translations)
+    {
+        stats.min_translation = stats.min_translation.cwiseMin(t);
+        stats.max_translation = stats.max_translation.cwiseMax(t);
+    }
+    
+    // 计算旋转统计（转换为欧拉角）
+    std::vector<Eigen::Vector3d> eulers;
+    for (const auto& rot : rotations)
+    {
+        Eigen::Matrix3d rot_copy = rot;
+        eulers.push_back(rotate2rpy(rot_copy));
+    }
+    
+    Eigen::Vector3d mean_euler = Eigen::Vector3d::Zero();
+    for (const auto& e : eulers)
+        mean_euler += e;
+    mean_euler /= eulers.size();
+    
+    Eigen::Vector3d euler_variance = Eigen::Vector3d::Zero();
+    for (const auto& e : eulers)
+    {
+        Eigen::Vector3d diff = e - mean_euler;
+        euler_variance += diff.cwiseProduct(diff);
+    }
+    euler_variance /= eulers.size();
+    stats.std_rotation_euler = euler_variance.cwiseSqrt();
+    
+    // 计算最大偏差（旋转）
+    stats.max_dev_rotation_euler = Eigen::Vector3d::Zero();
+    for (const auto& e : eulers)
+    {
+        Eigen::Vector3d diff = (e - mean_euler).cwiseAbs();
+        stats.max_dev_rotation_euler = stats.max_dev_rotation_euler.cwiseMax(diff);
+    }
+    
+    // 计算fitness统计
+    stats.mean_fitness = 0.0;
+    for (double f : fitnesses)
+        stats.mean_fitness += f;
+    stats.mean_fitness /= fitnesses.size();
+    
+    double fitness_variance = 0.0;
+    for (double f : fitnesses)
+    {
+        double diff = f - stats.mean_fitness;
+        fitness_variance += diff * diff;
+    }
+    fitness_variance /= fitnesses.size();
+    stats.std_fitness = std::sqrt(fitness_variance);
+    
+    stats.min_fitness = *std::min_element(fitnesses.begin(), fitnesses.end());
+    stats.max_fitness = *std::max_element(fitnesses.begin(), fitnesses.end());
+    
+    return stats;
+}
+
+void printRelocStatisticsReport(const RelocStatistics& stats)
+{
+    if (stats.poses.empty())
+    {
+        ROS_WARN("No statistics to report (empty poses)");
+        return;
+    }
+    
+    std::string separator(60, '=');
+    ROS_INFO("\n%s", separator.c_str());
+    ROS_INFO("Relocalization Consistency Analysis Report");
+    ROS_INFO("%s", separator.c_str());
+    
+    // 位置统计
+    ROS_INFO("\n--- Position Statistics (m) ---");
+    ROS_INFO("Mean:    [%.6f, %.6f, %.6f]", 
+             stats.mean_translation(0), stats.mean_translation(1), stats.mean_translation(2));
+    ROS_INFO("Std:     [%.6f, %.6f, %.6f]", 
+             stats.std_translation(0), stats.std_translation(1), stats.std_translation(2));
+    ROS_INFO("Max Dev: [%.6f, %.6f, %.6f]", 
+             stats.max_dev_translation(0), stats.max_dev_translation(1), stats.max_dev_translation(2));
+    ROS_INFO("Range:   [%.6f ~ %.6f, %.6f ~ %.6f, %.6f ~ %.6f]",
+             stats.min_translation(0), stats.max_translation(0),
+             stats.min_translation(1), stats.max_translation(1),
+             stats.min_translation(2), stats.max_translation(2));
+    
+    // 旋转统计（转换为度）
+    Eigen::Matrix3d mean_rot_copy = stats.mean_rotation;  // 创建副本，因为rotate2rpy需要非const引用
+    Eigen::Vector3d mean_euler = rotate2rpy(mean_rot_copy);
+    Eigen::Vector3d mean_euler_deg = mean_euler * 180.0 / M_PI;
+    Eigen::Vector3d std_euler_deg = stats.std_rotation_euler * 180.0 / M_PI;
+    Eigen::Vector3d max_dev_euler_deg = stats.max_dev_rotation_euler * 180.0 / M_PI;
+    
+    ROS_INFO("\n--- Rotation Statistics (deg) ---");
+    ROS_INFO("Mean Euler:    [%.4f, %.4f, %.4f]", 
+             mean_euler_deg(0), mean_euler_deg(1), mean_euler_deg(2));
+    ROS_INFO("Std Euler:     [%.4f, %.4f, %.4f]", 
+             std_euler_deg(0), std_euler_deg(1), std_euler_deg(2));
+    ROS_INFO("Max Dev Euler: [%.4f, %.4f, %.4f]", 
+             max_dev_euler_deg(0), max_dev_euler_deg(1), max_dev_euler_deg(2));
+    
+    // Fitness统计
+    ROS_INFO("\n--- Fitness Statistics ---");
+    ROS_INFO("Mean: %.6f", stats.mean_fitness);
+    ROS_INFO("Std:  %.6f", stats.std_fitness);
+    ROS_INFO("Min:  %.6f", stats.min_fitness);
+    ROS_INFO("Max:  %.6f", stats.max_fitness);
+    
+    // 最终平均位姿
+    Eigen::Quaterniond mean_quat(stats.mean_rotation);
+    Eigen::Matrix3d final_rot_copy = stats.mean_rotation;  // 创建副本
+    Eigen::Vector3d final_euler = rotate2rpy(final_rot_copy);
+    Eigen::Vector3d final_euler_deg = final_euler * 180.0 / M_PI;
+    
+    ROS_INFO("\n--- Final Offset (Mean) ---");
+    ROS_INFO("Translation: [%.6f, %.6f, %.6f]", 
+             stats.mean_translation(0), stats.mean_translation(1), stats.mean_translation(2));
+    ROS_INFO("Quaternion:  [%.6f, %.6f, %.6f, %.6f]", 
+             mean_quat.x(), mean_quat.y(), mean_quat.z(), mean_quat.w());
+    ROS_INFO("Euler (RPY): [%.4f, %.4f, %.4f] deg", 
+             final_euler_deg(0), final_euler_deg(1), final_euler_deg(2));
+    ROS_INFO("%s\n", separator.c_str());
 }

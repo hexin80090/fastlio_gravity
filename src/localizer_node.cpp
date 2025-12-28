@@ -1,6 +1,9 @@
 #include <thread>
 #include <csignal>
+#include <fstream>
 #include <ros/ros.h>
+#include <ros/package.h>
+#include "commons.h"
 #include "localizer/icp_localizer.h"
 #include "lio_builder/lio_builder.h"
 #include <tf2_ros/transform_broadcaster.h>
@@ -48,7 +51,9 @@ struct SharedData
 class LocalizerThread
 {
 public:
-    LocalizerThread() {}
+    LocalizerThread() : verification_mode_(false), verification_count_(20), 
+                       verification_rate_(1.0), fitness_threshold_(0.95), 
+                       offset_calculated_(false) {}
 
     void setSharedDate(std::shared_ptr<SharedData> shared_data)
     {
@@ -67,6 +72,114 @@ public:
     {
         icp_localizer_ = localizer;
     }
+    
+    void setVerificationParams(bool verification_mode, int verification_count, 
+                               double verification_rate, double fitness_threshold)
+    {
+        verification_mode_ = verification_mode;
+        verification_count_ = verification_count;
+        verification_rate_ = verification_rate;
+        fitness_threshold_ = fitness_threshold;
+    }
+    
+    bool calculateOffsetVerificationMode(const Eigen::Matrix4d& initial_guess)
+    {
+        ROS_INFO("=== Starting Offset Verification Mode (%d iterations) ===", verification_count_);
+        
+        std::vector<Eigen::Matrix4d> poses;
+        std::vector<double> fitnesses;
+        
+        ros::Rate verification_rate(verification_rate_);
+        
+        for (int i = 0; i < verification_count_; i++)
+        {
+            ROS_INFO("Iteration %d/%d...", i + 1, verification_count_);
+            
+            // 等待新的点云数据
+            while (ros::ok() && !shared_data_->pose_updated)
+            {
+                verification_rate.sleep();
+                ros::spinOnce();
+            }
+            
+            if (terminate_flag)
+                break;
+            
+            // 获取当前点云和位姿
+            Eigen::Matrix3d local_rot;
+            Eigen::Vector3d local_pos;
+            pcl::PointCloud<pcl::PointXYZI>::Ptr current_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+            {
+                std::lock_guard<std::mutex> lock(shared_data_->main_mutex);
+                shared_data_->pose_updated = false;
+                local_rot = shared_data_->local_rot;
+                local_pos = shared_data_->local_pos;
+                pcl::copyPointCloud(*shared_data_->cloud, *current_cloud);
+            }
+            
+            // 计算初始猜测（使用当前的offset）
+            Eigen::Matrix4d init_guess;
+            init_guess.setIdentity();
+            init_guess.block<3, 3>(0, 0) = shared_data_->offset_rot * local_rot;
+            init_guess.block<3, 1>(0, 3) = shared_data_->offset_rot * local_pos + shared_data_->offset_pos;
+            
+            // 执行ICP配准
+            Eigen::Matrix4d gloabl_pose = icp_localizer_->multi_align_sync(current_cloud, init_guess);
+            
+            if (icp_localizer_->isSuccess())
+            {
+                double fitness = icp_localizer_->getFitnessScore();
+                poses.push_back(gloabl_pose);
+                fitnesses.push_back(fitness);
+                ROS_INFO("  Fitness: %.6f", fitness);
+            }
+            else
+            {
+                ROS_WARN("  ICP alignment failed in iteration %d", i + 1);
+            }
+            
+            verification_rate.sleep();
+        }
+        
+        if (poses.empty())
+        {
+            ROS_ERROR("No successful alignments in verification mode!");
+            return false;
+        }
+        
+        // 计算统计信息
+        RelocStatistics stats = calculateRelocStatistics(poses, fitnesses);
+        
+        // 检查平均fitness是否满足阈值
+        // 注意：PCL的ICP getFitnessScore()返回的是误差值（越小越好），不是匹配度
+        // 所以应该检查是否小于阈值，而不是大于
+        // 使用localizer的thresh作为参考，fitness应该小于thresh才认为成功
+        // 这里使用fitness_threshold_作为最大允许误差（应该设置为较小的值，如0.1）
+        if (stats.mean_fitness > fitness_threshold_)
+        {
+            ROS_ERROR("Mean fitness (error) %.6f above threshold %.6f", stats.mean_fitness, fitness_threshold_);
+            ROS_ERROR("Offset calculation failed!");
+            return false;
+        }
+        
+        // 打印统计报告
+        printRelocStatisticsReport(stats);
+        
+        // 使用平均位姿计算offset
+        {
+            std::lock_guard<std::mutex> lock(shared_data_->main_mutex);
+            // 获取最后一次的local_rot和local_pos（用于计算offset）
+            Eigen::Matrix3d final_local_rot = shared_data_->local_rot;
+            Eigen::Vector3d final_local_pos = shared_data_->local_pos;
+            
+            // 使用平均位姿计算offset
+            shared_data_->offset_rot = stats.mean_rotation * final_local_rot.transpose();
+            shared_data_->offset_pos = -stats.mean_rotation * final_local_rot.transpose() * final_local_pos + stats.mean_translation;
+        }
+        
+        ROS_INFO("Offset calculation completed successfully using mean pose!");
+        return true;
+    }
 
     void operator()()
     {
@@ -81,56 +194,81 @@ public:
                 continue;
             if (!shared_data_->localizer_activate)
                 continue;
-            if (!shared_data_->pose_updated)
-                continue;
-            gloabl_pose_.setIdentity();
-            bool rectify = false;
-            Eigen::Matrix4d init_guess;
+            
+            // 如果已经计算过offset（验证模式），不再更新
+            if (offset_calculated_)
             {
-                std::lock_guard<std::mutex> lock(shared_data_->main_mutex);
-                shared_data_->pose_updated = false;
-                init_guess.setIdentity();
-                local_rot_ = shared_data_->local_rot;
-                local_pos_ = shared_data_->local_pos;
-                init_guess.block<3, 3>(0, 0) = shared_data_->offset_rot * local_rot_;
-                init_guess.block<3, 1>(0, 3) = shared_data_->offset_rot * local_pos_ + shared_data_->offset_pos;
-                pcl::copyPointCloud(*shared_data_->cloud, *current_cloud_);
+                continue;  // 保持线程运行，但不再更新offset
             }
-
+            
+            // 只在 service_called 时执行验证模式或单次计算
             if (shared_data_->service_called)
             {
                 std::lock_guard<std::mutex> lock(shared_data_->service_mutex);
                 shared_data_->service_called = false;
                 icp_localizer_->init(shared_data_->map_path, false);
-                gloabl_pose_ = icp_localizer_->multi_align_sync(current_cloud_, shared_data_->initial_guess);
-                if (icp_localizer_->isSuccess())
+                
+                bool success = false;
+                if (verification_mode_)
                 {
-                    rectify = true;
-                    shared_data_->localizer_activate = true;
-                    shared_data_->service_success = true;
+                    // 验证模式：20次匹配取均值
+                    success = calculateOffsetVerificationMode(shared_data_->initial_guess);
+                    if (success)
+                    {
+                        offset_calculated_ = true;
+                        shared_data_->localizer_activate = true;
+                        shared_data_->service_success = true;
+                    }
+                    else
+                    {
+                        shared_data_->localizer_activate = false;
+                        shared_data_->service_success = false;
+                    }
                 }
-
                 else
                 {
-                    rectify = false;
-                    shared_data_->localizer_activate = false;
-                    shared_data_->service_success = false;
+                    // 正常模式：单次计算
+                    while (ros::ok() && !shared_data_->pose_updated)
+                    {
+                        rate_->sleep();
+                        ros::spinOnce();
+                    }
+                    
+                    if (terminate_flag)
+                        break;
+                    
+                    Eigen::Matrix3d local_rot;
+                    Eigen::Vector3d local_pos;
+                    {
+                        std::lock_guard<std::mutex> lock_main(shared_data_->main_mutex);
+                        shared_data_->pose_updated = false;
+                        local_rot = shared_data_->local_rot;
+                        local_pos = shared_data_->local_pos;
+                        pcl::copyPointCloud(*shared_data_->cloud, *current_cloud_);
+                    }
+                    
+                    Eigen::Matrix4d gloabl_pose = icp_localizer_->multi_align_sync(current_cloud_, shared_data_->initial_guess);
+                    
+                    // 注意：PCL的fitness是误差值（越小越好），应该检查是否小于阈值
+                    if (icp_localizer_->isSuccess() && icp_localizer_->getFitnessScore() <= fitness_threshold_)
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock_main(shared_data_->main_mutex);
+                            shared_data_->offset_rot = gloabl_pose.block<3, 3>(0, 0) * local_rot.transpose();
+                            shared_data_->offset_pos = -gloabl_pose.block<3, 3>(0, 0) * local_rot.transpose() * local_pos + gloabl_pose.block<3, 1>(0, 3);
+                        }
+                        offset_calculated_ = true;
+                        shared_data_->localizer_activate = true;
+                        shared_data_->service_success = true;
+                        success = true;
+                    }
+                    else
+                    {
+                        shared_data_->localizer_activate = false;
+                        shared_data_->service_success = false;
+                        success = false;
+                    }
                 }
-            }
-            else
-            {
-                gloabl_pose_ = icp_localizer_->align(current_cloud_, init_guess);
-                if (icp_localizer_->isSuccess())
-                    rectify = true;
-                else
-                    rectify = false;
-            }
-
-            if (rectify)
-            {
-                std::lock_guard<std::mutex> lock(shared_data_->main_mutex);
-                shared_data_->offset_rot = gloabl_pose_.block<3, 3>(0, 0) * local_rot_.transpose();
-                shared_data_->offset_pos = -gloabl_pose_.block<3, 3>(0, 0) * local_rot_.transpose() * local_pos_ + gloabl_pose_.block<3, 1>(0, 3);
             }
         }
     }
@@ -143,6 +281,13 @@ private:
     Eigen::Matrix4d gloabl_pose_;
     Eigen::Matrix3d local_rot_;
     Eigen::Vector3d local_pos_;
+    
+    // 验证模式参数
+    bool verification_mode_;
+    int verification_count_;
+    double verification_rate_;
+    double fitness_threshold_;
+    bool offset_calculated_;  // 标志：offset是否已计算（固定后不再更新）
 };
 
 class LocalizerROS
@@ -165,6 +310,61 @@ public:
         localizer_loop_.setSharedDate(shared_data);
         localizer_loop_.setLocalizer(icp_localizer_);
         localizer_thread_ = std::make_shared<std::thread>(std::ref(localizer_loop_));
+        
+        // 自动加载点云地图
+        if (auto_load_enable_ && !auto_load_map_path_.empty())
+        {
+            std::string map_path = auto_load_map_path_;
+            // 如果路径不是绝对路径，则相对于包目录
+            if (map_path[0] != '/')
+            {
+                std::string package_path = ros::package::getPath("fastlio");
+                if (!package_path.empty())
+                {
+                    map_path = package_path + "/" + map_path;
+                }
+            }
+            
+            // 检查文件是否存在
+            std::ifstream file_check(map_path);
+            if (file_check.good())
+            {
+                file_check.close();
+                ROS_INFO("Auto-loading map from: %s", map_path.c_str());
+                
+                // 设置地图路径并初始化定位器
+                {
+                    std::lock_guard<std::mutex> lock(shared_data->service_mutex);
+                    shared_data->map_path = map_path;
+                    shared_data->localizer_activate = true;
+                    
+                    // 如果启用自动重定位，设置初始位姿
+                    if (auto_load_auto_reloc_)
+                    {
+                        Eigen::AngleAxisf rollAngle(auto_load_initial_roll_, Eigen::Vector3f::UnitX());
+                        Eigen::AngleAxisf pitchAngle(auto_load_initial_pitch_, Eigen::Vector3f::UnitY());
+                        Eigen::AngleAxisf yawAngle(auto_load_initial_yaw_, Eigen::Vector3f::UnitZ());
+                        Eigen::Quaternionf q = rollAngle * pitchAngle * yawAngle;
+                        shared_data->initial_guess.block<3, 3>(0, 0) = q.toRotationMatrix().cast<double>();
+                        shared_data->initial_guess.block<3, 1>(0, 3) = Eigen::Vector3d(auto_load_initial_x_, auto_load_initial_y_, auto_load_initial_z_);
+                        shared_data->service_called = true;
+                        ROS_INFO("Auto-relocalization enabled with initial pose: x=%.2f, y=%.2f, z=%.2f, roll=%.2f, pitch=%.2f, yaw=%.2f",
+                                 auto_load_initial_x_, auto_load_initial_y_, auto_load_initial_z_,
+                                 auto_load_initial_roll_, auto_load_initial_pitch_, auto_load_initial_yaw_);
+                    }
+                    else
+                    {
+                        // 只加载地图，不进行重定位
+                        icp_localizer_->init(map_path, false);
+                        ROS_INFO("Map loaded successfully (without auto-relocalization)");
+                    }
+                }
+            }
+            else
+            {
+                ROS_WARN("Map file not found at: %s. Please check the path or disable auto_load.", map_path.c_str());
+            }
+        }
     }
 
     void initParams()
@@ -198,6 +398,28 @@ public:
         nh_.param<double>("localizer/xy_offset", localizer_params_.xy_offset, 2.0);
         nh_.param<double>("localizer/yaw_resolution", localizer_params_.yaw_resolution, 0.5);
         nh_.param<int>("localizer/yaw_offset", localizer_params_.yaw_offset, 1);
+        
+        // 验证模式参数
+        bool verification_mode;
+        int verification_count;
+        double verification_rate;
+        double fitness_threshold;
+        nh_.param<bool>("localizer/verification_mode", verification_mode, true);
+        nh_.param<int>("localizer/verification_count", verification_count, 20);
+        nh_.param<double>("localizer/verification_rate", verification_rate, 1.0);
+        nh_.param<double>("localizer/fitness_threshold", fitness_threshold, 0.95);
+        localizer_loop_.setVerificationParams(verification_mode, verification_count, verification_rate, fitness_threshold);
+
+        // 自动加载点云地图配置
+        nh_.param<bool>("auto_load/enable", auto_load_enable_, false);
+        nh_.param<std::string>("auto_load/map_path", auto_load_map_path_, "");
+        nh_.param<bool>("auto_load/auto_reloc", auto_load_auto_reloc_, false);
+        nh_.param<double>("auto_load/initial_pose/x", auto_load_initial_x_, 0.0);
+        nh_.param<double>("auto_load/initial_pose/y", auto_load_initial_y_, 0.0);
+        nh_.param<double>("auto_load/initial_pose/z", auto_load_initial_z_, 0.0);
+        nh_.param<double>("auto_load/initial_pose/roll", auto_load_initial_roll_, 0.0);
+        nh_.param<double>("auto_load/initial_pose/pitch", auto_load_initial_pitch_, 0.0);
+        nh_.param<double>("auto_load/initial_pose/yaw", auto_load_initial_yaw_, 0.0);
     }
 
     void initSubscribers()
@@ -211,6 +433,8 @@ public:
         local_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("local_cloud", 1000);
         body_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("body_cloud", 1000);
         odom_pub_ = nh_.advertise<nav_msgs::Odometry>("slam_odom", 1000);
+        // 定位模式：发布到 /mavros/local_position/odom（格式与 faster-lio/fast_lio_localization 一致）
+        odom_mavros_pub_ = nh_.advertise<nav_msgs::Odometry>("/mavros/local_position/odom", 100000);
         map_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("map_cloud", 1000);
     }
 
@@ -306,9 +530,10 @@ public:
 
     void publishOdom(const nav_msgs::Odometry &odom_to_pub)
     {
-        if (odom_pub_.getNumSubscribers() == 0)
-            return;
-        odom_pub_.publish(odom_to_pub);
+        if (odom_pub_.getNumSubscribers() > 0)
+            odom_pub_.publish(odom_to_pub);
+        // 定位模式：发布到 /mavros/local_position/odom（格式与 faster-lio/fast_lio_localization 一致）
+        odom_mavros_pub_.publish(odom_to_pub);
     }
 
     void systemReset()
@@ -373,11 +598,36 @@ public:
                 global_frame_,
                 local_frame_,
                 current_time_));
-            publishOdom(eigen2Odometry(current_state_.rot.toRotationMatrix(),
-                                       current_state_.pos,
-                                       local_frame_,
-                                       body_frame_,
-                                       current_time_));
+            // 获取速度和角速度
+            Eigen::Vector3d vel = current_state_.vel;
+            Eigen::Vector3d angular_vel(0, 0, 0);
+            if (!measure_group_.imus.empty())
+            {
+                // 使用最新的IMU数据获取角速度
+                angular_vel(0) = measure_group_.imus.back().gyro(0);
+                angular_vel(1) = measure_group_.imus.back().gyro(1);
+                angular_vel(2) = measure_group_.imus.back().gyro(2);
+            }
+            
+            // 获取协方差矩阵
+            auto kf = lio_builder_->getKF();
+            auto P = kf->get_P();
+            
+            // 计算全局坐标系下的位姿（camera_init -> body）
+            // 全局位姿 = offset * local位姿
+            Eigen::Matrix3d global_rot = offset_rot_ * current_state_.rot.toRotationMatrix();
+            Eigen::Vector3d global_pos = offset_rot_ * current_state_.pos + offset_pos_;
+            
+            // 生成完整的Odometry（格式与 faster-lio/fast_lio_localization 一致）
+            nav_msgs::Odometry odom_full = eigen2OdometryFull(
+                global_rot, global_pos,
+                vel, angular_vel, P,
+                "camera_init",  // 使用 camera_init 作为 frame_id（与 faster-lio/fast_lio_localization 一致）
+                "body",
+                current_time_
+            );
+            
+            publishOdom(odom_full);
             publishCloud(body_cloud_pub_,
                          pcl2msg(current_cloud_body_,
                                  body_frame_,
@@ -430,7 +680,15 @@ private:
 
     ros::Subscriber livox_sub_;
 
+    // 自动加载相关
+    bool auto_load_enable_;
+    std::string auto_load_map_path_;
+    bool auto_load_auto_reloc_;
+    double auto_load_initial_x_, auto_load_initial_y_, auto_load_initial_z_;
+    double auto_load_initial_roll_, auto_load_initial_pitch_, auto_load_initial_yaw_;
+
     ros::Publisher odom_pub_;
+    ros::Publisher odom_mavros_pub_;  // 定位模式：发布到 /mavros/local_position/odom
 
     ros::Publisher body_cloud_pub_;
 

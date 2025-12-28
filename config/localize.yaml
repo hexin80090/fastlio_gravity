@@ -9,21 +9,42 @@ loop_rate: 1.0
 publish_map_cloud: true
 
 lio_builder:
-  det_range: 100.0
-  cube_len: 500.0
-  resolution: 0.2
-  move_thresh: 1.5
+  det_range: 20.0              # 室内环境：20米检测范围（与建图模式一致）
+  cube_len: 100.0              # 室内环境：100米局部地图（与建图模式一致）
+  resolution: 0.1              # 室内环境：0.1米分辨率（与建图模式一致）
+  move_thresh: 0.5             # 室内环境：0.5米阈值（与建图模式一致）
   align_gravity: true
   imu_ext_rot: [1, 0, 0, 0, 1, 0, 0, 0, 1]
   imu_ext_pos: [-0.011, -0.02329, 0.04412]
 
 localizer:
-  refine_resolution: 0.2
-  rough_resolution: 0.5
+  refine_resolution: 0.1       # 室内环境：0.1米精细匹配（更精细，提高定位精度）
+  rough_resolution: 0.3        # 室内环境：0.3米粗匹配（室内空间小，可减小）
   refine_iter: 5
   rough_iter: 10
-  thresh: 0.15
-  xy_offset: 1.0
+  thresh: 0.12                 # 室内环境：0.12阈值（更严格，室内特征明显）
+  xy_offset: 0.5               # 室内环境：0.5米搜索范围（室内空间小，可减小）
   yaw_offset: 0
-  yaw_resolution: 0.5
+  yaw_resolution: 0.3          # 室内环境：0.3弧度分辨率（更精细的角度搜索）
+  verification_mode: true      # 是否启用验证模式（20次匹配取均值）
+  verification_count: 20        # 验证模式计算次数
+  verification_rate: 1.0       # 验证模式采样频率 (Hz)
+  fitness_threshold: 0.1      # ICP配准fitness阈值（PCL的fitness是误差值，越小越好，建议0.05-0.15）
+
+# 定位模式不需要保存点云地图
+# auto_save:
+#   enable: false
+
+# 自动加载点云地图配置
+auto_load:
+  enable: true                    # 是否在启动时自动加载点云地图
+  map_path: "PCD/scans.pcd"      # 点云地图路径（相对于包目录，或使用绝对路径）
+  auto_reloc: true                # 是否自动进行重定位（需要提供初始位姿）
+  initial_pose:                   # 初始位姿（仅在auto_reloc=true时使用）
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
 
