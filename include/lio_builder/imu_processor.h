@@ -78,5 +78,9 @@ namespace fastlio
         Eigen::Vector3d acc_bias_cov_;
 
         Eigen::Matrix<double, 12, 12> Q_;
+        
+        // For dip and dip direction calculation
+        int dip_calc_count_ = 0;
+        bool dip_calculated_ = false;
     };
 } // namespace fastlio

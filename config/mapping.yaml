@@ -7,22 +7,29 @@ livox_topic: /livox/lidar
 local_rate: 20.0
 loop_rate: 1.0
 lio_builder:
-  det_range: 100.0
-  cube_len: 500.0
-  resolution: 0.2
-  move_thresh: 1.5
+  det_range: 20.0              # 室内环境：20米检测范围（室内通常10-30米即可）
+  cube_len: 100.0              # 室内环境：100米局部地图（室内空间较小，可减小）
+  resolution: 0.1              # 室内环境：0.1米分辨率（更精细，适合室内）
+  move_thresh: 0.3             # 降低阈值，增加关键帧密度，提高建图精度
   align_gravity: true
-  imu_ext_rot: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  imu_ext_pos: [-0.011, -0.02329, 0.04412]
+  # 外参已通过 faster-lio 自动标定（2024-12-27 12:13）
+  # 标定结果：roll: 0.387°, pitch: -0.850°, yaw: 1.559°
+  imu_ext_rot: [0.999520, -0.027305, -0.014648, 0.027202, 0.999604, -0.007160, 0.014837, 0.006758, 0.999867]
+  imu_ext_pos: [0.027692, -0.000659, 0.107330]
 
 loop_closure:
-  activate: true
-  rad_thresh: 0.2
-  dist_thresh: 1.0
-  time_thresh: 30.0
-  loop_pose_search_radius: 20.0
-  loop_pose_index_thresh: 20
-  submap_resolution: 0.25
-  submap_search_num: 25
-  loop_icp_thresh: 0.1
+  activate: true   # 回环检测已启用，用于解决"飘走"问题
+  rad_thresh: 0.3              # 放宽角度阈值，避免关键帧过少
+  dist_thresh: 1.5             # 放宽距离阈值，增加关键帧密度
+  time_thresh: 20.0            # 增加时间阈值，给回环检测更多机会
+  loop_pose_search_radius: 15.0 # 增大搜索半径，提高回环检测成功率
+  loop_pose_index_thresh: 8     # 减少关键帧间隔要求，更频繁检测回环
+  submap_resolution: 0.15       # 室内环境：0.15米（更精细的子地图）
+  submap_search_num: 30         # 增加子地图数量，提高回环匹配成功率
+  loop_icp_thresh: 0.15         # 放宽ICP阈值，避免误判回环失败
+
+# 自动保存地图配置
+auto_save:
+  enable: true                    # 是否在程序退出时自动保存地图
+  save_path: "PCD/scans.pcd"     # 自动保存路径（相对于包目录，或使用绝对路径）
 
