@@ -36,6 +36,9 @@ find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
 
+# ===== 添加 livox_ros_driver2 安装路径到 CMAKE_PREFIX_PATH =====
+# 如 livox_ros_driver2 找不到，请修改为你本地的 livox_ws 路径
+list(APPEND CMAKE_PREFIX_PATH "/home/amov/livox_ws/devel")
 
 find_package(catkin REQUIRED COMPONENTS
   tf2
@@ -77,10 +80,10 @@ generate_messages(
 
 
 catkin_package(
-#  INCLUDE_DIRS include
-#  LIBRARIES fastlio
-#  CATKIN_DEPENDS roscpp std_msgs
-#  DEPENDS system_lib
+  INCLUDE_DIRS include
+  LIBRARIES fastlio
+  CATKIN_DEPENDS roscpp std_msgs message_runtime
+  DEPENDS system_lib
 )
 
 
@@ -90,6 +93,9 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
 )
+
+# 确保包含生成的消息头文件路径
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 set(COMMON_SRC src/commons.cpp)
 set(KDTREE_SRC include/ikd-Tree/ikd_Tree.cpp)
@@ -101,11 +107,15 @@ set(SRC_LIST ${COMMON_SRC} ${KDTREE_SRC} ${LIOBUILDER_SRC_LIST} ${ICPLOCALIZER_S
 
 add_executable(map_builder_node src/map_builder_node.cpp ${SRC_LIST})
 
+add_dependencies(map_builder_node ${PROJECT_NAME}_generate_messages_cpp)
+
 target_link_libraries(map_builder_node
   ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam
 )
 
 add_executable(localizer_node src/localizer_node.cpp ${SRC_LIST})
+
+add_dependencies(localizer_node ${PROJECT_NAME}_generate_messages_cpp)
 
 target_link_libraries(localizer_node
   ${catkin_LIBRARIES} ${PCL_LIBRARIES}

@@ -4,6 +4,7 @@
 #include <thread>
 #include <csignal>
 #include <ros/ros.h>
+#include <ros/package.h>
 
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
@@ -451,6 +452,10 @@ public:
         nh_.param<double>("loop_closure/submap_resolution", loop_closure_.mutableParams().submap_resolution, 0.2);
         nh_.param<int>("loop_closure/submap_search_num", loop_closure_.mutableParams().submap_search_num, 20);
         nh_.param<double>("loop_closure/loop_icp_thresh", loop_closure_.mutableParams().loop_icp_thresh, 0.3);
+
+        // 自动保存配置
+        nh_.param<bool>("auto_save/enable", auto_save_enable_, false);
+        nh_.param<std::string>("auto_save/save_path", auto_save_path_, "PCD/scans.pcd");
     }
 
     void initSubscribers()
@@ -464,6 +469,8 @@ public:
         local_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("local_cloud", 1000);
         body_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("body_cloud", 1000);
         odom_pub_ = nh_.advertise<nav_msgs::Odometry>("slam_odom", 1000);
+        // 建图模式：发布到 /Odometry（与 faster-lio/fast_lio_localization 一致）
+        odom_standard_pub_ = nh_.advertise<nav_msgs::Odometry>("/Odometry", 100000);
         loop_mark_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("loop_mark", 1000);
 
         local_path_pub_ = nh_.advertise<nav_msgs::Path>("local_path", 1000);
@@ -484,9 +491,10 @@ public:
 
     void publishOdom(const nav_msgs::Odometry &odom_to_pub)
     {
-        if (odom_pub_.getNumSubscribers() == 0)
-            return;
-        odom_pub_.publish(odom_to_pub);
+        if (odom_pub_.getNumSubscribers() > 0)
+            odom_pub_.publish(odom_to_pub);
+        // 建图模式：发布到 /Odometry（与 faster-lio/fast_lio_localization 一致）
+        odom_standard_pub_.publish(odom_to_pub);
     }
 
     void publishLocalPath()
@@ -609,26 +617,47 @@ public:
     bool saveMapCallback(fastlio::SaveMap::Request &req, fastlio::SaveMap::Response &res)
     {
         std::string file_path = req.save_path;
-        fastlio::PointCloudXYZI::Ptr cloud(new fastlio::PointCloudXYZI);
-        for (Pose6D &p : shared_data_->key_poses)
+        bool success = saveMapInternal(file_path);
+        if (success)
         {
-            fastlio::PointCloudXYZI::Ptr temp_cloud(new fastlio::PointCloudXYZI);
-            // Eigen::Quaterniond grav_diff = Eigen::Quaterniond::FromTwoVectors(p.gravity, Eigen::Vector3d(0, 0, -1));
-            pcl::transformPointCloud(*shared_data_->cloud_history[p.index],
-                                     *temp_cloud,
-                                     p.global_pos.cast<float>(),
-                                     Eigen::Quaternionf(p.global_rot.cast<float>()));
-            *cloud += *temp_cloud;
+            res.status = true;
+            res.message = "Save map success!";
+        }
+        else
+        {
+            res.status = false;
+            res.message = "Empty cloud or save failed!";
+        }
+        return success;
+    }
+
+    // 内部保存函数，供服务回调和自动保存使用
+    bool saveMapInternal(const std::string &file_path)
+    {
+        fastlio::PointCloudXYZI::Ptr cloud(new fastlio::PointCloudXYZI);
+        {
+            std::lock_guard<std::mutex> lock(shared_data_->mutex);
+            for (Pose6D &p : shared_data_->key_poses)
+            {
+                if (p.index >= 0 && p.index < static_cast<int>(shared_data_->cloud_history.size()))
+                {
+                    fastlio::PointCloudXYZI::Ptr temp_cloud(new fastlio::PointCloudXYZI);
+                    // Eigen::Quaterniond grav_diff = Eigen::Quaterniond::FromTwoVectors(p.gravity, Eigen::Vector3d(0, 0, -1));
+                    pcl::transformPointCloud(*shared_data_->cloud_history[p.index],
+                                             *temp_cloud,
+                                             p.global_pos.cast<float>(),
+                                             Eigen::Quaternionf(p.global_rot.cast<float>()));
+                    *cloud += *temp_cloud;
+                }
+            }
         }
         if (cloud->empty())
         {
-            res.status = false;
-            res.message = "Empty cloud!";
+            ROS_WARN("Cannot save map: point cloud is empty!");
             return false;
         }
-        res.status = true;
-        res.message = "Save map success!";
         writer_.writeBinaryCompressed(file_path, *cloud);
+        ROS_INFO("Map saved successfully to: %s (points: %zu)", file_path.c_str(), cloud->size());
         return true;
     }
 
@@ -689,11 +718,36 @@ public:
                                               body_frame_,
                                               current_time_));
 
-            publishOdom(eigen2Odometry(current_state_.rot.toRotationMatrix(),
-                                       current_state_.pos,
-                                       local_frame_,
-                                       body_frame_,
-                                       current_time_));
+            // 获取速度和角速度
+            Eigen::Vector3d vel = current_state_.vel;
+            Eigen::Vector3d angular_vel(0, 0, 0);
+            if (!measure_group_.imus.empty())
+            {
+                // 使用最新的IMU数据获取角速度
+                angular_vel(0) = measure_group_.imus.back().gyro(0);
+                angular_vel(1) = measure_group_.imus.back().gyro(1);
+                angular_vel(2) = measure_group_.imus.back().gyro(2);
+            }
+            
+            // 获取协方差矩阵
+            auto kf = lio_builder_->getKF();
+            auto P = kf->get_P();
+            
+            // 计算全局坐标系下的位姿（camera_init -> body）
+            // 全局位姿 = offset * local位姿
+            Eigen::Matrix3d global_rot = shared_data_->offset_rot * current_state_.rot.toRotationMatrix();
+            Eigen::Vector3d global_pos = shared_data_->offset_rot * current_state_.pos + shared_data_->offset_pos;
+            
+            // 生成完整的Odometry（格式与 faster-lio/fast_lio_localization 一致）
+            nav_msgs::Odometry odom_full = eigen2OdometryFull(
+                global_rot, global_pos,
+                vel, angular_vel, P,
+                "camera_init",  // 使用 camera_init 作为 frame_id（与 faster-lio/fast_lio_localization 一致）
+                "body",
+                current_time_
+            );
+            
+            publishOdom(odom_full);
 
             addKeyPose();
 
@@ -711,6 +765,33 @@ public:
         }
 
         loop_thread_->join();
+        
+        // 自动保存地图
+        if (auto_save_enable_)
+        {
+            std::string save_path = auto_save_path_;
+            // 如果路径不是绝对路径，则相对于包目录
+            if (save_path[0] != '/')
+            {
+                // 获取包路径
+                std::string package_path = ros::package::getPath("fastlio");
+                if (!package_path.empty())
+                {
+                    save_path = package_path + "/" + save_path;
+                }
+            }
+            // 确保目录存在
+            size_t last_slash = save_path.find_last_of("/");
+            if (last_slash != std::string::npos)
+            {
+                std::string dir_path = save_path.substr(0, last_slash);
+                std::string mkdir_cmd = "mkdir -p " + dir_path;
+                system(mkdir_cmd.c_str());
+            }
+            ROS_INFO("Auto-saving map to: %s", save_path.c_str());
+            saveMapInternal(save_path);
+        }
+        
         std::cout << "MAPPING NODE IS DOWN!" << std::endl;
     }
 
@@ -744,6 +825,7 @@ private:
     ros::Publisher local_cloud_pub_;
 
     ros::Publisher odom_pub_;
+    ros::Publisher odom_standard_pub_;  // 发布到 /Odometry 话题
 
     ros::Publisher loop_mark_pub_;
 
@@ -754,6 +836,10 @@ private:
     ros::ServiceServer save_map_server_;
 
     pcl::PCDWriter writer_;
+
+    // 自动保存相关
+    bool auto_save_enable_;
+    std::string auto_save_path_;
 };
 
 int main(int argc, char **argv)
